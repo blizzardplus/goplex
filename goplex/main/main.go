@@ -1,26 +1,42 @@
 package main 
 
-import (
-"pt"
-"net"
-"fmt"
-//"bufio"
-//"strings"
-"sync"
-"io"
-"syscall"
-"os"
-"os/signal"
+	import (
+	"pt"
+	"net"
+	"fmt"
+	//"bufio"
+	//"strings"
+	"sync"
+	"io"
+	"syscall"
+	"os"
+	"os/signal"
 )
 
+
+type InternalBuf struct {
+	}
+
+// Read reads data from the connection.
+// Read can be made to time out and return a Error with Timeout() == true
+// after a fixed time limit; see SetDeadline and SetReadDeadline.
+func (ib InternalBuf) Read(b []byte) (n int, err error){
+	return 0, nil
+}
+
+// Write writes data to the connection.
+// Write can be made to time out and return a Error with Timeout() == true
+// after a fixed time limit; see SetDeadline and SetWriteDeadline.
+func (ib InternalBuf) Write(b []byte) (n int, err error){
+	return 0, nil
+}
 
 
 var handlerChan = make(chan int)
 
 
-func copyLoop(a, b net.Conn) error {
+func copyLoop(aArr, bArr []net.Conn) error {
 // Note: b is always the pt connection.  a is the SOCKS/ORPort connection.
-//fmt.Print("In copyLoop")
 	errChan := make(chan error, 2)
 
 	var wg sync.WaitGroup
@@ -28,16 +44,16 @@ func copyLoop(a, b net.Conn) error {
 
 	go func() {
 		defer wg.Done()
-		defer b.Close()
-		defer a.Close()
-		_, err := io.Copy(b, a)
+		defer bArr[0].Close()
+		defer aArr[0].Close()
+		_, err := io.Copy(bArr[0], aArr[0])
 		errChan <- err
 	}()
 	go func() {
 		defer wg.Done()
-		defer a.Close()
-		defer b.Close()
-		_, err := io.Copy(a, b)
+		defer aArr[0].Close()
+		defer bArr[0].Close()
+		_, err := io.Copy(aArr[0], bArr[0])
 		errChan <- err
 	}()
 
@@ -47,7 +63,7 @@ func copyLoop(a, b net.Conn) error {
 // first error is returned.
 		wg.Wait()
 		if len(errChan) > 0 {
-			//fmt.Print("Closing connection")
+			fmt.Print("Closing connection")
 			return <-errChan
 		}
 
@@ -68,8 +84,8 @@ func handler(conn *pt.SocksConn) error {
 	}
 	// do something with conn and remote.
 	//conn.Write([]byte("Hi" + "\n"))
-	for {
-		copyLoop(conn, remote)
+	//for {
+	copyLoop([]net.Conn {conn}, []net.Conn {remote})
 
 	//message, _ := bufio.NewReader(conn).ReadString('\n')
 
@@ -78,7 +94,7 @@ func handler(conn *pt.SocksConn) error {
 	//newmessage := strings.ToUpper(message)
 
 	//conn.Write([]byte(newmessage + "\n"))
-	}
+	//}
 	return nil
 }
 
@@ -102,6 +118,7 @@ func acceptLoop(ln *pt.SocksListener) error {
 	}
 }
 func main() {
+	go StartServer()
 	var err error
 // 		var ptInfo pt.ClientInfo
 	listeners := make([]net.Listener, 0)
