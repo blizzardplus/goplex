@@ -4,58 +4,128 @@ package main
 	"pt"
 	"net"
 	"fmt"
+	"errors"
 	//"bufio"
 	//"strings"
 	"sync"
+    //"sync/atomic"
 	"io"
 	"syscall"
 	"os"
 	"os/signal"
+	"container/list"
+//	"bufio"
 )
 
 
 type InternalBuf struct {
-	}
+	bufList* list.List
+	consProdChan chan bool
+	mutex* sync.Mutex
+	debug bool
+}
+
+func NewIntBuff() *InternalBuf{
+	p := new(InternalBuf)
+	p.bufList = list.New()
+	p.consProdChan = make(chan bool, 1)
+	p.mutex = &sync.Mutex{}
+	return p
+}
 
 // Read reads data from the connection.
 // Read can be made to time out and return a Error with Timeout() == true
 // after a fixed time limit; see SetDeadline and SetReadDeadline.
 func (ib InternalBuf) Read(b []byte) (n int, err error){
-	return 0, nil
+	//fmt.Printf("Waiting to Read: %s!\n\n\n",b)
+	chanErr:= <- ib.consProdChan
+	ib.mutex.Lock()
+	if chanErr!= true {
+		err = errors.New("Channel Error")
+		fmt.Printf("Error!")
+		return 0, io.EOF
+	}
+
+	read := ib.bufList.Front().Value.([]byte)
+	if(len(read)==0) {return 0, io.EOF}
+	for i, p := range read {
+		b[i] = p
+	}
+
+	ib.bufList.Remove(ib.bufList.Front())
+	if ib.debug {
+		//fmt.Printf("R: %s!\n\n\n",b)
+		fmt.Printf("\nRlen: %d!\n",len(read))
+		}
+	ib.mutex.Unlock()
+
+	return len(read), err
 }
 
 // Write writes data to the connection.
 // Write can be made to time out and return a Error with Timeout() == true
 // after a fixed time limit; see SetDeadline and SetWriteDeadline.
 func (ib InternalBuf) Write(b []byte) (n int, err error){
-	return 0, nil
+	ib.mutex.Lock()
+	defer ib.mutex.Unlock()
+	if(len(b)==0) {return 0, io.EOF}
+	ib.bufList.PushBack(b)
+	ib.consProdChan <- true
+	if ib.debug {
+		 //fmt.Printf("W: %s!\n\n\n",b)
+		 fmt.Printf("\nWlen: %d!\n",len(b))
+		 //fmt.Printf("len: %d!\n\n\n",len(ib.bufList.Front().Value.([]byte)))
+	}
+
+	return len(b), err
 }
 
 
 var handlerChan = make(chan int)
 
 
-func copyLoop(aArr, bArr []net.Conn) error {
+func copyLoop(aArr, bArr []net.Conn, a2bBuff, b2aBuff *InternalBuf) error {
 // Note: b is always the pt connection.  a is the SOCKS/ORPort connection.
-	errChan := make(chan error, 2)
+	errChan := make(chan error, 4)
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(4)
 
 	go func() {
 		defer wg.Done()
 		defer bArr[0].Close()
 		defer aArr[0].Close()
-		_, err := io.Copy(bArr[0], aArr[0])
+		_, err := io.Copy(bArr[0], a2bBuff)
+
 		errChan <- err
 	}()
+
+	go func() {
+		defer wg.Done()
+		defer bArr[0].Close()
+		defer aArr[0].Close()
+		_, err := io.Copy(a2bBuff, aArr[0])
+		errChan <- err
+	}()
+
 	go func() {
 		defer wg.Done()
 		defer aArr[0].Close()
 		defer bArr[0].Close()
-		_, err := io.Copy(aArr[0], bArr[0])
+		_, err := io.Copy(aArr[0], b2aBuff)
+
 		errChan <- err
 	}()
+
+	go func() {
+		defer wg.Done()
+		defer aArr[0].Close()
+		defer bArr[0].Close()
+		_, err := io.Copy(b2aBuff, bArr[0])
+		errChan <- err
+	}()
+
+
 
 // Wait for both upstream and downstream to close.  Since one side
 // terminating closes the other, the second error in the channel will be
@@ -82,19 +152,12 @@ func handler(conn *pt.SocksConn) error {
 	if err != nil {
 		return err
 	}
-	// do something with conn and remote.
-	//conn.Write([]byte("Hi" + "\n"))
-	//for {
-	copyLoop([]net.Conn {conn}, []net.Conn {remote})
+	a2bBuff := NewIntBuff()
+	a2bBuff.debug = true
+	b2aBuff := NewIntBuff()
+	b2aBuff.debug = true
+	copyLoop([]net.Conn {conn}, []net.Conn {remote}, a2bBuff, b2aBuff)
 
-	//message, _ := bufio.NewReader(conn).ReadString('\n')
-
-	//fmt.Print("Message Received:", string(message))
-
-	//newmessage := strings.ToUpper(message)
-
-	//conn.Write([]byte(newmessage + "\n"))
-	//}
 	return nil
 }
 
