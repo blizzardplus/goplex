@@ -38,34 +38,37 @@ type Connection struct{
 	upStrms, downStrms []Stream
 	upStrmSendChan, upStrmRecvChan, downStrmSendChan, downStrmRcvChan chan int
 	upStrmBuf, downStrmBuf IntrConnBuf
-	streamBufs map[Stream]IntrStrBuf
+	upStreamBufs, downStreamBufs map[int]IntrStrBuf
 	nextStream, numStream int
 	upStreamLastSent, upStreamLastRecv, downStreamLastSent, downStreamLastRecv uint32
-	nextSeq uint32 
+	nextSeqToSend, nextSeqExpected uint32 
 	hopNum int
 	nextHopAddr []string
-	//mutex* sync.Mutex
+	mutex* sync.Mutex
 }
 
 func newConnection(hopNumber int/*, something to indicate next hop*/) *Connection{
 	conn := new(Connection)
-	conn.nextSeq = 0
+	conn.nextSeqToSend = 0
+	conn.nextSeqExpected = 0
+	conn.nextStream = 0
 	conn.hopNum = hopNumber
-	conn.streamBufs = make(map[Stream]IntrStrBuf)
+	conn.upStreamBufs = make(map[int]IntrStrBuf)
+	conn.downStreamBufs = make(map[int]IntrStrBuf)
 	conn.upStrmBuf = *NewIntrConnBuf(true)
 	conn.downStrmBuf = *NewIntrConnBuf(false)
+	conn.mutex = &sync.Mutex{}
 	return conn
 }
 
 func (conn Connection) addStream(stream Stream) (){
 	strmBuf := NewIntrStrBuf(true)
-	conn.streamBufs[stream] = *strmBuf
+	conn.upStreamBufs[conn.numStream] = *strmBuf
+	conn.numStream++
 }
 
 func (conn Connection) createPacket(data []byte, seqNo uint32) *Packet{
-	header := make([]byte, 2)
-	binary.LittleEndian.PutUint32(header, seqNo)
-	packet := NewPacket(header, data)
+	packet := NewPacket(seqNo, data)
 	return packet
 }
 
@@ -96,9 +99,10 @@ func (conn Connection) upStream(upSendChan, upRecvChan chan int) error{
 				dbgLog.Println("R: %s!\n\n\n",read)
 				Dump(read)
 				dbgLog.Println("\nRlen: %d!\n",len(read))
-				}
+			}
 			//Round robin
-			conn.upStrms[conn.nextStream].sendPacketBytes(read, true)
+			conn.upStreamBufs[conn.nextStream].bufList.PushBack(read)
+			conn.upStreamBufs[conn.nextStream].consProdChan <- true
 			conn.nextStream = (conn.nextStream+1) % conn.numStream
 		}
 		conn.upStrmBuf.mutex.Unlock()
@@ -151,7 +155,8 @@ func (str Stream) sendPacketBytes(packet []byte, isUpStream bool)(){
 
 
 //Packet interface
-var pktHeaderSize int = 4
+const pktSeqSize = 4
+const pktLenSize = 4
 
 type Packet struct{
 	sequence, length, payload []byte
@@ -162,6 +167,10 @@ func (p Packet) getSequence() uint32{
 	return binary.BigEndian.Uint32(p.sequence)
 }
 
+func (p Packet) getLength() uint32{
+	return binary.BigEndian.Uint32(p.length)
+}
+
 func (p Packet) toByte() []byte{
 	//totalLength := len(p.sequence) + len(p.length) + len(p.payload)
 	tmp := append(p.sequence, p.length...)
@@ -169,12 +178,14 @@ func (p Packet) toByte() []byte{
 	return data
 }
 
-func NewPacket(sequence, payload []byte) *Packet{
+func NewPacket(sequence uint32, payload []byte) *Packet{
 	p := new(Packet)
-	p.sequence = sequence
+	p.sequence = make([]byte, pktSeqSize)
+	p.length = make([]byte, pktLenSize)
+	binary.LittleEndian.PutUint32(p.sequence, sequence) 
 	p.payload = payload
 	//p.length = uint32(len(header) + len(data))
-	binary.LittleEndian.PutUint32(p.length, uint32(len(sequence) + len(payload))) 
+	binary.LittleEndian.PutUint32(p.length, sequence + uint32(len(payload))) 
 	return p
 }
 
@@ -201,8 +212,12 @@ func NewIntrConnBuf(upStream bool) *IntrConnBuf{
 func (buf IntrConnBuf) getNext() []Packet{
 	for e := buf.bufList.Front(); e != nil; e = e.Next() {
 		seq := e.Value.(Packet).getSequence()
-		if seq == connection.nextSeq {
+		if seq == connection.nextSeqExpected {
 			data := make([]Packet, 1)
+			if(debugEn){
+				dbgLog.Println("\n")
+				Dump(data[0].toByte())
+			}
 			return data
 		}
 	}
@@ -271,24 +286,27 @@ func (ib IntrConnBuf) Read(b []byte) (n int, err error){
 // after a fixed time limit; see SetDeadline and SetWriteDeadline.
 func (ib IntrConnBuf) Write(b []byte) (n int, err error){
 	ib.mutex.Lock()
+	connection.mutex.Lock()
 	defer ib.mutex.Unlock()
+	defer connection.mutex.Unlock()
+	
 	
 	if(len(b)==0) {return 0, io.EOF}
-	NewPacket(b[0:pktHeaderSize - 1], b[pktHeaderSize: len(b) - 1]) 
-	ib.bufList.PushBack(b)
 	
-//	if ib.isUpstream {
-//		ib.str.conn.upStreamChan <- true
-//	} else {
-//		ib.str.conn.downStreamChan <- true
-//	}
-	
+	if (connection.hopNum == 1){
+		seq := connection.nextSeqToSend
+		//packet := NewPacket(seq, b[pktHeaderSize: len(b) - 1])
+		packet := *NewPacket(seq, b)
+		connection.nextSeqToSend += packet.getLength() + 1  
+		ib.bufList.PushBack(packet)
+		
+	}
 	if ib.debug {
 		dbgLog.Println("IntrConnBuf:Write")
 		dbgLog.Println("W: %s!\n\n\n",b)
 		dbgLog.Println("\nWlen: %d!\n",len(b))
 	}
-
+	
 	ib.consProdChan <- true
 	return len(b), err
 }
@@ -337,7 +355,7 @@ func (ib IntrStrBuf) Write(b []byte) (n int, err error){
 	defer ib.mutex.Unlock()
 	
 	if(len(b)==0) {return 0, io.EOF}
-	NewPacket(b[0:pktHeaderSize - 1], b[pktHeaderSize: len(b) - 1]) 
+	//NewPacket(b[0:pktHeaderSize - 1], b[pktHeaderSize: len(b) - 1]) 
 	ib.bufList.PushBack(b)
 	
 //	if ib.isUpstream {
@@ -446,7 +464,7 @@ func handler(conn *pt.SocksConn) error {
 	var newStream Stream
 	connection.addStream(newStream)
 	
-	copyLoop([]net.Conn {conn},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream.upStrmBuf)
+	copyLoop([]net.Conn {conn},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream.downStrmBuf)
 	
 
 	return nil
