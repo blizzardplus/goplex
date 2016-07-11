@@ -38,8 +38,8 @@ type Connection struct{
 	upStrms, downStrms []Stream
 	upStrmSendChan, upStrmRecvChan, downStrmSendChan, downStrmRcvChan chan int
 	upStrmBuf, downStrmBuf IntrConnBuf
-	upStreamBufs, downStreamBufs map[int]IntrStrBuf
-	nextStream, numStream int
+	upStreamBufs, downStreamBufs map[int]*IntrStrBuf
+	nextUpStream, numUpStream, nextDownStream, numDownStream int
 	upStreamLastSent, upStreamLastRecv, downStreamLastSent, downStreamLastRecv uint32
 	nextSeqToSend, nextSeqExpected uint32 
 	hopNum int
@@ -51,33 +51,41 @@ func newConnection(hopNumber int/*, something to indicate next hop*/) *Connectio
 	conn := new(Connection)
 	conn.nextSeqToSend = 0
 	conn.nextSeqExpected = 0
-	conn.nextStream = 0
+	conn.nextUpStream = 0
+	conn.nextDownStream = 0
 	conn.hopNum = hopNumber
-	conn.upStreamBufs = make(map[int]IntrStrBuf)
-	conn.downStreamBufs = make(map[int]IntrStrBuf)
-	conn.upStrmBuf = *NewIntrConnBuf(true)
-	conn.downStrmBuf = *NewIntrConnBuf(false)
+	conn.upStreamBufs = make(map[int]*IntrStrBuf)
+	conn.downStreamBufs = make(map[int]*IntrStrBuf)
+	conn.upStrmBuf = *NewIntrConnBuf(true, conn)
+	conn.downStrmBuf = *NewIntrConnBuf(false, conn)
 	conn.mutex = &sync.Mutex{}
 	return conn
 }
 
-func (conn Connection) addStream(stream Stream) (){
+func (conn *Connection) addUpStream(stream Stream) (){
 	strmBuf := NewIntrStrBuf(true)
-	conn.upStreamBufs[conn.numStream] = *strmBuf
-	conn.numStream++
+	conn.upStreamBufs[conn.numUpStream] = strmBuf
+	conn.numUpStream ++
+	dbgLog.Println("Up Stream number:" +  strconv.Itoa(conn.numUpStream))
 }
 
-func (conn Connection) createPacket(data []byte, seqNo uint32) *Packet{
+func (conn *Connection) addDownStream(stream Stream) (){
+	strmBuf := NewIntrStrBuf(true)
+	conn.downStreamBufs[conn.numDownStream] = strmBuf
+	conn.numDownStream++
+}
+
+func (conn *Connection) createPacket(data []byte, seqNo uint32) *Packet{
 	packet := NewPacket(seqNo, data)
 	return packet
 }
 
 //Direction: client to server
-func (conn Connection) handleUpStream(){
+func (conn *Connection) handleUpStream(){
 	conn.upStream(conn.upStrmSendChan, conn.upStrmRecvChan)
 }
 
-func (conn Connection) upStream(upSendChan, upRecvChan chan int) error{
+func (conn *Connection) upStream(upSendChan, upRecvChan chan int) error{
 	
 	errChan := make(chan error, 2)
 
@@ -87,25 +95,27 @@ func (conn Connection) upStream(upSendChan, upRecvChan chan int) error{
 
 	//Send routine
 	go func() {
-		_ = <- conn.upStrmBuf.consProdChan
-		conn.upStrmBuf.mutex.Lock()
-		for len(conn.upStrmBuf.getNext()) > 0 {
-			read := conn.upStrmBuf.bufList.Front().Value.(Packet).toByte()
-			if(len(read)==0) {
-				errChan <- io.EOF
-				return
+		for {
+			_ = <- conn.upStrmBuf.consProdChan
+			conn.upStrmBuf.mutex.Lock()
+			defer conn.upStrmBuf.mutex.Unlock()
+			for len(conn.upStrmBuf.getNext()) > 0 {
+				read := conn.upStrmBuf.bufList.Front().Value.(Packet).toByte()
+				if(len(read)==0) {
+					errChan <- io.EOF
+					return
+				}
+				if debugEn {
+					dbgLog.Println("R: %s!\n\n\n",read)
+					Dump(read)
+					dbgLog.Println("\nRlen: %d!\n",len(read))
+				}
+				//Round robin
+				conn.upStreamBufs[conn.nextUpStream].bufList.PushBack(read)
+				conn.upStreamBufs[conn.nextUpStream].consProdChan <- true
+				conn.nextUpStream = (conn.nextUpStream+1) % conn.numUpStream
 			}
-			if debugEn {
-				dbgLog.Println("R: %s!\n\n\n",read)
-				Dump(read)
-				dbgLog.Println("\nRlen: %d!\n",len(read))
-			}
-			//Round robin
-			conn.upStreamBufs[conn.nextStream].bufList.PushBack(read)
-			conn.upStreamBufs[conn.nextStream].consProdChan <- true
-			conn.nextStream = (conn.nextStream+1) % conn.numStream
 		}
-		conn.upStrmBuf.mutex.Unlock()
 	} ()
 
 	//Receive routine
@@ -128,7 +138,7 @@ func (conn Connection) upStream(upSendChan, upRecvChan chan int) error{
 }
 
 //Direction: server to client
-func (conn Connection) downStream() (){
+func (conn *Connection) downStream() (){
 	
 }
 
@@ -136,7 +146,7 @@ func (conn Connection) downStream() (){
 ////STREAM Interface
 type Stream struct{
 	conn *Connection
-	upStrmBuf, downStrmBuf IntrStrBuf
+	strmBuf IntrStrBuf
 }
 
 func newStream(conn *Connection) *Stream{
@@ -192,6 +202,7 @@ func NewPacket(sequence uint32, payload []byte) *Packet{
 //Internal buffer interface 
 //TODO:(Make the two inherit the same class)
 type IntrConnBuf struct {
+	conn *Connection
 	bufList* list.List
 	consProdChan chan bool
 	mutex* sync.Mutex
@@ -200,8 +211,9 @@ type IntrConnBuf struct {
 	debug bool
 }
 
-func NewIntrConnBuf(upStream bool) *IntrConnBuf{
+func NewIntrConnBuf(upStream bool, conn *Connection) *IntrConnBuf{
 	p := new(IntrConnBuf)
+	p.conn = conn
 	p.bufList = list.New()
 	p.consProdChan = make(chan bool, 1)
 	p.mutex = &sync.Mutex{}
@@ -211,16 +223,20 @@ func NewIntrConnBuf(upStream bool) *IntrConnBuf{
 
 func (buf IntrConnBuf) getNext() []Packet{
 	for e := buf.bufList.Front(); e != nil; e = e.Next() {
-		seq := e.Value.(Packet).getSequence()
+		packet := e.Value.(Packet)
+		seq := packet.getSequence()
 		if seq == connection.nextSeqExpected {
 			data := make([]Packet, 1)
+			data[0] = packet
 			if(debugEn){
 				dbgLog.Println("\n")
 				Dump(data[0].toByte())
 			}
+			connection.nextSeqExpected += packet.getLength()
 			return data
 		}
 	}
+
 	data := make([]Packet, 0)
 	return data
 
@@ -252,7 +268,7 @@ func NewIntrStrBuf(upStream bool) *IntrStrBuf{
 // Read reads data from the connection.
 // Read can be made to time out and return a Error with Timeout() == true
 // after a fixed time limit; see SetDeadline and SetReadDeadline.
-func (ib IntrConnBuf) Read(b []byte) (n int, err error){
+func (ib *IntrConnBuf) Read(b []byte) (n int, err error){
 	dbgLog.Println("Waiting to Read: %s!\n\n\n",b)
 	chanErr:= <- ib.consProdChan
 	ib.mutex.Lock()
@@ -284,7 +300,7 @@ func (ib IntrConnBuf) Read(b []byte) (n int, err error){
 // Write writes data to the connection.
 // Write can be made to time out and return a Error with Timeout() == true
 // after a fixed time limit; see SetDeadline and SetWriteDeadline.
-func (ib IntrConnBuf) Write(b []byte) (n int, err error){
+func (ib *IntrConnBuf) Write(b []byte) (n int, err error){
 	ib.mutex.Lock()
 	connection.mutex.Lock()
 	defer ib.mutex.Unlock()
@@ -314,9 +330,9 @@ func (ib IntrConnBuf) Write(b []byte) (n int, err error){
 // Read reads data from the connection.
 // Read can be made to time out and return a Error with Timeout() == true
 // after a fixed time limit; see SetDeadline and SetReadDeadline.
-func (ib IntrStrBuf) Read(b []byte) (n int, err error){
+func (ib *IntrStrBuf) Read(b []byte) (n int, err error){
 	
-	/*
+	
 	dbgLog.Println("Waiting to Read: %s!\n\n\n",b)
 	chanErr:= <- ib.consProdChan
 	ib.mutex.Lock()
@@ -343,14 +359,12 @@ func (ib IntrStrBuf) Read(b []byte) (n int, err error){
 	}
 
 	return len(read), err
-	*/
-	return 0, err
 }
 
 // Write writes data to the connection.
 // Write can be made to time out and return a Error with Timeout() == true
 // after a fixed time limit; see SetDeadline and SetWriteDeadline.
-func (ib IntrStrBuf) Write(b []byte) (n int, err error){
+func (ib *IntrStrBuf) Write(b []byte) (n int, err error){
 	ib.mutex.Lock()
 	defer ib.mutex.Unlock()
 	
@@ -422,7 +436,7 @@ func copyLoop(aArr/*, bArr */[]net.Conn, a2bBuff IntrConnBuf, b2aBuff IntrStrBuf
 	go func() {
 		defer wg.Done()
 		defer aArr[0].Close()
-		_, err := io.Copy(a2bBuff, aArr[0])
+		_, err := io.Copy(&a2bBuff, aArr[0])
 		errChan <- err
 	}()
 
@@ -430,7 +444,7 @@ func copyLoop(aArr/*, bArr */[]net.Conn, a2bBuff IntrConnBuf, b2aBuff IntrStrBuf
 	go func() {
 		defer wg.Done()
 		defer aArr[0].Close()
-		_, err := io.Copy(aArr[0], b2aBuff)
+		_, err := io.Copy(aArr[0], &b2aBuff)
 		errChan <- err
 	}()
 
@@ -449,22 +463,66 @@ func copyLoop(aArr/*, bArr */[]net.Conn, a2bBuff IntrConnBuf, b2aBuff IntrStrBuf
 	}
 func handler(conn *pt.SocksConn) error {
 	infoLog.Println("Handler!")
-	defer conn.Close()
-	remote, err := net.Dial("tcp", conn.Req.Target)
-	if err != nil {
-		conn.Reject()
-		return err
-	}
-	defer remote.Close()
-	err = conn.Grant(remote.RemoteAddr().(*net.TCPAddr))
-	if err != nil {
-		return err
+	if (connection.hopNum == 1) {
+		defer conn.Close()
+		remote1, err1 := net.Dial("tcp", "127.0.0.1:33333")
+		remote2, err2 := net.Dial("tcp", "127.0.0.1:44444")
+		if err1 != nil || err2 != nil {
+			conn.Reject()
+			if err1 != nil {return err1}
+			if err2 != nil {return err2}
+		}
+		
+		//Make new streams
+		newStream1 := *newStream(connection)
+		connection.addUpStream(newStream1)
+		
+		newStream2 := *newStream(connection)
+		connection.addUpStream(newStream2)
+		
+		 
+		go copyLoop([]net.Conn {remote1},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream1.strmBuf)
+		go copyLoop([]net.Conn {remote2},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream2.strmBuf)
+	
+		
+		defer remote1.Close()
+		defer remote2.Close()
+		addr, err1:= net.ResolveTCPAddr("tcp","127.0.0.1:33333")
+		err1 = conn.Grant(addr)
+		if err1 != nil {
+			return err1
+		}
+	} else if (connection.hopNum == 2 ||  connection.hopNum == 3 ){
+		defer conn.Close()
+		remote, err := net.Dial("tcp", "127.0.0.1:55555")
+		if err != nil {
+			conn.Reject()
+			return err
+		}
+		defer remote.Close()
+		addr, err:= net.ResolveTCPAddr("tcp","127.0.0.1:55555")
+		err = conn.Grant(addr)
+		if err != nil {
+			return err
+		}
+	} else if (connection.hopNum == 4) {
+		defer conn.Close()
+		remote, err := net.Dial("tcp", conn.Req.Target)
+		if err != nil {
+			conn.Reject()
+			return err
+		}
+		defer remote.Close()
+		err = conn.Grant(remote.RemoteAddr().(*net.TCPAddr))
+		if err != nil {
+			return err
+		}
 	}
 
-	var newStream Stream
-	connection.addStream(newStream)
-	
-	copyLoop([]net.Conn {conn},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream.downStrmBuf)
+	newStream := *newStream(connection)
+	connection.addDownStream(newStream)
+	//TODO: This should be a separate function that connects the socket, stream and connection buffer 
+	copyLoop([]net.Conn {conn},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream.strmBuf)
 	
 
 	return nil
@@ -504,7 +562,8 @@ func intiateLogger(){
 
 func main() {
 	intiateLogger()
-	go StartServer()
+	//TODO: Implement REST server
+	//go StartServer()
 	var err error
 // 		var ptInfo pt.ClientInfo
 
@@ -516,8 +575,18 @@ func main() {
 	go connection.handleUpStream()
 	
 	listeners := make([]net.Listener, 0)
+	
+	var ln *pt.SocksListener
+	if (connection.hopNum == 1) {
+		ln, err = pt.ListenSocks("tcp", "127.0.0.1:22222")
+	} else if (connection.hopNum == 2){
+		ln, err = pt.ListenSocks("tcp", "127.0.0.1:33333")
+	} else if (connection.hopNum == 3){
+		ln, err = pt.ListenSocks("tcp", "127.0.0.1:44444")
+	} else if (connection.hopNum == 4){
+		ln, err = pt.ListenSocks("tcp", "127.0.0.1:55555")
+	}
 
-	ln, err := pt.ListenSocks("tcp", "127.0.0.1:44444")
 
 	if err != nil {
 		errLog.Println("Error!")
