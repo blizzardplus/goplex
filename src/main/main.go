@@ -77,7 +77,7 @@ func (conn *Connection) addDownStream(stream *Stream) (){
 }
 
 func (conn *Connection) createPacket(data []byte, seqNo uint32) *Packet{
-	packet := NewPacket(seqNo, data)
+	packet := NewPacketWithSeq(seqNo, data)
 	return packet
 }
 
@@ -99,23 +99,28 @@ func (conn *Connection) upStream(upSendChan, upRecvChan chan int) error{
 		for {
 			_ = <- conn.upStrmBuf.consProdChan
 			conn.upStrmBuf.mutex.Lock()
-			defer conn.upStrmBuf.mutex.Unlock()
-			for len(conn.upStrmBuf.getNext()) > 0 {
-				read := conn.upStrmBuf.bufList.Front().Value.(Packet).toByte()
+			
+			nextPacket := conn.upStrmBuf.getNext()
+			for len(nextPacket) > 0 {
+				read := nextPacket[0].toByte()
 				if(len(read)==0) {
 					errChan <- io.EOF
 					return
 				}
 				if debugEn {
 					dbgLog.Println("R: %s!\n\n\n",read)
-					Dump(read)
+					//Dump(read)
 					dbgLog.Println("\nRlen: %d!\n",len(read))
 				}
 				//Round robin
 				conn.upStreamBufs[conn.nextUpStream].bufList.PushBack(read)
 				conn.upStreamBufs[conn.nextUpStream].consProdChan <- true
 				conn.nextUpStream = (conn.nextUpStream+1) % conn.numUpStream
+				
+				//Start over
+				nextPacket = conn.upStrmBuf.getNext()
 			}
+			conn.upStrmBuf.mutex.Unlock()
 		}
 	} ()
 
@@ -196,14 +201,20 @@ func (p Packet) toByte() []byte{
 	return data
 }
 
-func NewPacket(sequence uint32, payload []byte) *Packet{
+func NewPacketFromBytes(bytes []byte) *Packet{
+	//TODO: Probably a better implementation since we already have the byte slice
+	//Something like union is better
+	p := NewPacketWithSeq(binary.BigEndian.Uint32(bytes[0:pktSeqSize]),  bytes[pktSeqSize+pktLenSize :])
+	return p
+}
+func NewPacketWithSeq(sequence uint32, payload []byte) *Packet{
 	p := new(Packet)
 	p.sequence = make([]byte, pktSeqSize)
 	p.length = make([]byte, pktLenSize)
-	binary.LittleEndian.PutUint32(p.sequence, sequence) 
+	binary.BigEndian.PutUint32(p.sequence, sequence) 
 	p.payload = payload
 	//p.length = uint32(len(header) + len(data))
-	binary.LittleEndian.PutUint32(p.length, sequence + uint32(len(payload))) 
+	binary.BigEndian.PutUint32(p.length, sequence + uint32(len(payload))) 
 	return p
 }
 
@@ -229,23 +240,30 @@ func NewIntrConnBuf(upStream bool, conn *Connection) *IntrConnBuf{
 	return p
 }
 
-func (buf IntrConnBuf) getNext() []Packet{
+func (buf IntrConnBuf) getNext() []*Packet{
 	for e := buf.bufList.Front(); e != nil; e = e.Next() {
-		packet := e.Value.(Packet)
+		packet := e.Value.(*Packet)
+		//Dump(packet.toByte())
 		seq := packet.getSequence()
-		if seq == connection.nextSeqExpected {
-			data := make([]Packet, 1)
+		temp := connection.nextSeqExpected
+		if seq == temp {
+			data := make([]*Packet, 1)
+			//TODO: Do not copy, find a way to return the value before removing the packet from list
 			data[0] = packet
+			dbgLog.Println("TTTT")
+			Dump(data[0].toByte())
 			if(debugEn){
 				dbgLog.Println("\n")
-				Dump(data[0].toByte())
+				//Dump(data[0].toByte())
 			}
-			connection.nextSeqExpected += packet.getLength()
+			buf.bufList.Remove(e)
+			temp2 := packet.getLength()
+			connection.nextSeqExpected += (temp2 + 1)
 			return data
 		}
 	}
 
-	data := make([]Packet, 0)
+	data := make([]*Packet, 0)
 	return data
 
 }
@@ -278,6 +296,7 @@ func NewIntrStrBuf(upStream bool, str *Stream) *IntrStrBuf{
 // Read can be made to time out and return a Error with Timeout() == true
 // after a fixed time limit; see SetDeadline and SetReadDeadline.
 func (ib *IntrConnBuf) Read(b []byte) (n int, err error){
+	/*
 	dbgLog.Println("Waiting to Read: %s!\n\n\n",b)
 	chanErr:= <- ib.consProdChan
 	ib.mutex.Lock()
@@ -304,6 +323,8 @@ func (ib *IntrConnBuf) Read(b []byte) (n int, err error){
 	}
 
 	return len(read), err
+	*/
+	return 0, err
 }
 
 // Write writes data to the connection.
@@ -321,15 +342,23 @@ func (ib *IntrConnBuf) Write(b []byte) (n int, err error){
 	if (connection.hopNum == 1){
 		seq := connection.nextSeqToSend
 		//packet := NewPacket(seq, b[pktHeaderSize: len(b) - 1])
-		packet := *NewPacket(seq, b)
+		packet := NewPacketWithSeq(seq, b)
 		connection.nextSeqToSend += packet.getLength() + 1  
 		ib.bufList.PushBack(packet)
+		Dump(packet.toByte())
 		
+	} else if (connection.hopNum == 2 || connection.hopNum == 3){
+		//packet := NewPacket(seq, b[pktHeaderSize: len(b) - 1])
+		packet := NewPacketFromBytes(b)
+		Dump(packet.payload)
+		connection.nextSeqToSend += packet.getLength() + 1  
+		ib.bufList.PushBack(packet)
 	}
 	if ib.debug {
 		dbgLog.Println("IntrConnBuf:Write")
-		dbgLog.Println("W: %s!\n\n\n",b)
-		dbgLog.Println("\nWlen: %d!\n",len(b))
+		Dump(b)
+		//dbgLog.Println("W: %s!\n\n\n",b)
+		//dbgLog.Println("\nWlen: %d!\n",len(b))
 	}
 	
 	ib.consProdChan <- true
@@ -362,9 +391,9 @@ func (ib *IntrStrBuf) Read(b []byte) (n int, err error){
 	ib.bufList.Remove(ib.bufList.Front())
 	
 	if ib.debug {
-		dbgLog.Println("IntrStrBuf:Read")
+		//dbgLog.Println("IntrStrBuf:Read")
 		//dbgLog.Println("R: %s!\n\n\n",b)
-		dbgLog.Println("\nRlen: %d!\n",len(read))
+		//dbgLog.Println("\nRlen: %d!\n",len(read))
 	}
 
 	return len(read), err
@@ -398,6 +427,59 @@ func (ib *IntrStrBuf) Write(b []byte) (n int, err error){
 
 
 var handlerChan = make(chan int)
+func regSocket2ConnBuf(connBuf *IntrConnBuf, sockets []net.Conn) error {
+	errChan := make(chan error, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	
+	go func() {
+		defer wg.Done()
+		defer sockets[0].Close()
+		_, err := io.Copy(connBuf, sockets[0])
+		errChan <- err
+	}()
+
+	wg.Wait()
+	if len(errChan) > 0 {
+
+		infoLog.Println("Closing connection")
+		return <-errChan
+	}
+
+	return nil
+}
+
+func regStrBuf2Socket(sockets []net.Conn, strBuf *IntrStrBuf) error {
+// Note: b is always the pt connection.  a is the SOCKS/ORPort connection.
+	errChan := make(chan error, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+
+	go func() {
+		defer wg.Done()
+		defer sockets[0].Close()
+		_, err := io.Copy(sockets[0], strBuf)
+		errChan <- err
+	}()
+
+
+// Wait for both upstream and downstream to close.  Since one side
+// terminating closes the other, the second error in the channel will be
+// something like EINVAL (though io.Copy() will swallow EOF), so only the
+// first error is returned.
+	wg.Wait()
+	if len(errChan) > 0 {
+
+		infoLog.Println("Closing connection")
+		return <-errChan
+	}
+
+	return nil
+}
+
 
 func copyLoop(aArr/*, bArr */[]net.Conn, a2bBuff *IntrConnBuf, b2aBuff *IntrStrBuf) error {
 // Note: b is always the pt connection.  a is the SOCKS/ORPort connection.
@@ -406,42 +488,6 @@ func copyLoop(aArr/*, bArr */[]net.Conn, a2bBuff *IntrConnBuf, b2aBuff *IntrStrB
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-/*
-	go func() {
-		defer wg.Done()
-		defer bArr[0].Close()
-		defer aArr[0].Close()
-		_, err := io.Copy(bArr[0], a2bBuff)
-
-		errChan <- err
-	}()
-
-	go func() {
-		defer wg.Done()
-		defer bArr[0].Close()
-		defer aArr[0].Close()
-		_, err := io.Copy(a2bBuff, aArr[0])
-		errChan <- err
-	}()
-
-	go func() {
-		defer wg.Done()
-		defer aArr[0].Close()
-		defer bArr[0].Close()
-		_, err := io.Copy(aArr[0], b2aBuff)
-
-		errChan <- err
-	}()
-
-	go func() {
-		defer wg.Done()
-		defer aArr[0].Close()
-		defer bArr[0].Close()
-		_, err := io.Copy(b2aBuff, bArr[0])
-		errChan <- err
-	}()
-
-*/
 	go func() {
 		defer wg.Done()
 		defer aArr[0].Close()
@@ -502,9 +548,10 @@ func handler(conn *pt.SocksConn) error {
 		newStream2 := newStream(connection)
 		connection.addUpStream(newStream2)
 		
-		 
-		go copyLoop([]net.Conn {remote1},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream1.strmBuf)
-		go copyLoop([]net.Conn {remote2},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream2.strmBuf)
+		go regStrBuf2Socket([]net.Conn {remote1}, newStream1.strmBuf)
+		go regStrBuf2Socket([]net.Conn {remote2}, newStream2.strmBuf)
+		//go copyLoop([]net.Conn {remote1},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream1.strmBuf)
+		//go copyLoop([]net.Conn {remote2},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream2.strmBuf)
 	
 		
 		defer remote1.Close()
@@ -531,8 +578,8 @@ func handler(conn *pt.SocksConn) error {
 		newStream := newStream(connection)
 		connection.addUpStream(newStream)
 		
-		 
-		go copyLoop([]net.Conn {remote},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream.strmBuf)
+		go regStrBuf2Socket([]net.Conn {remote}, newStream.strmBuf)
+		//go copyLoop([]net.Conn {conn},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream.strmBuf)
 		
 		defer remote.Close()
 		addr, err:= net.ResolveTCPAddr("tcp","127.0.0.1:55555")
@@ -550,7 +597,7 @@ func handler(conn *pt.SocksConn) error {
 		
 		//Make new streams
 		newStream := newStream(connection)
-		connection.addUpStream(newStream)
+		//connection.addUpStream(newStream)
 		
 		 
 		go copyLoop([]net.Conn {remote},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream.strmBuf)

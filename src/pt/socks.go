@@ -330,7 +330,7 @@ func (s *socks4) Dial(network, addr string) (c net.Conn, err error) {
 	
 	socksV4a := false
 	var ip4 net.IP
-	if ipAddr == nil{
+	if ipAddr != nil{
 		ip, err := net.ResolveIPAddr("ip4", host)
 		if err != nil {
 			return nil, &socks4Error{message: ErrHostUnknown, details: err}
