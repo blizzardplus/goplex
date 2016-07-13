@@ -43,7 +43,7 @@ type Connection struct{
 	upStreamBufs, downStreamBufs map[int]*IntrStrBuf
 	nextUpStream, numUpStream, nextDownStream, numDownStream int
 	upStreamLastSent, upStreamLastRecv, downStreamLastSent, downStreamLastRecv uint32
-	nextSeqToSend, nextSeqExpected uint32 
+	nextSeqToSend uint32 
 	hopNum int
 	nextHopAddr []string
 	mutex* sync.Mutex
@@ -52,7 +52,6 @@ type Connection struct{
 func newConnection(hopNumber int/*, something to indicate next hop*/) *Connection{
 	conn := new(Connection)
 	conn.nextSeqToSend = 0
-	conn.nextSeqExpected = 0
 	conn.nextUpStream = 0
 	conn.nextDownStream = 0
 	conn.hopNum = hopNumber
@@ -66,13 +65,11 @@ func newConnection(hopNumber int/*, something to indicate next hop*/) *Connectio
 
 func (conn *Connection) addUpStream(stream *Stream) (){
 	conn.upStreamBufs[conn.numUpStream] = stream.strmBuf
-	conn.numUpStream ++
-	dbgLog.Println("Up Stream number:" +  strconv.Itoa(conn.numUpStream))
+	conn.numUpStream++
 }
 
 func (conn *Connection) addDownStream(stream *Stream) (){
-	strmBuf := NewIntrStrBuf(true, stream)
-	conn.downStreamBufs[conn.numDownStream] = strmBuf
+	conn.downStreamBufs[conn.numDownStream] = stream.strmBuf
 	conn.numDownStream++
 }
 
@@ -81,58 +78,104 @@ func (conn *Connection) createPacket(data []byte, seqNo uint32) *Packet{
 	return packet
 }
 
-//Direction: client to server
-func (conn *Connection) handleUpStream(){
-	conn.upStream(conn.upStrmSendChan, conn.upStrmRecvChan)
+func (conn *Connection) getStrmBuf(isUpStream bool) *IntrConnBuf{
+	if isUpStream { 
+		return conn.upStrmBuf
+	}else
+	{
+		return conn.downStrmBuf
+	}
 }
 
-func (conn *Connection) upStream(upSendChan, upRecvChan chan int) error{
+func (conn *Connection) getNextStream(isUpStream bool) int{
+	if isUpStream { 
+		return conn.nextUpStream
+	}else
+	{
+		return conn.nextDownStream
+	}
+}
+
+func (conn *Connection) setNextStream(isUpStream bool, val int) {
+	if isUpStream { 
+		conn.nextUpStream = val
+	}else
+	{
+		conn.nextDownStream = val
+	}
+}
+
+func (conn *Connection) getNumStreams(isUpStream bool) int{
+	if isUpStream { 
+		return conn.numUpStream
+	}else
+	{
+		return conn.numDownStream
+	}
+}
+
+func (conn *Connection) getStreamBufs(isUpStream bool) map[int]*IntrStrBuf{
+	if isUpStream { 
+		return conn.upStreamBufs
+	}else
+	{
+		return conn.downStreamBufs
+	}
+}
+
+
+
+//Direction: client to server
+func (conn *Connection) handleUpStream(){
+	go conn.handleStream(true)
+	go conn.handleStream(false)
+}
+
+func (conn *Connection) handleStream(isUpStream bool) error{
 	
-	errChan := make(chan error, 2)
+	errChan := make(chan error, 1)
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(1)
 
 
+
+//conn.upStrmBuf
+//conn.nextUpStream
+//conn.numUpStream
 	//Send routine
 	go func() {
 		for {
-			_ = <- conn.upStrmBuf.consProdChan
-			conn.upStrmBuf.mutex.Lock()
-			
-			nextPacket := conn.upStrmBuf.getNext()
+			_ = <- conn.getStrmBuf(isUpStream).consProdChan
+
+			if(!isUpStream) {
+				fmt.Println("Here")
+			}
+
+			nextPacket := conn.getStrmBuf(isUpStream).getNext()
+
 			for len(nextPacket) > 0 {
-				read := nextPacket[0].toByte()
-				if(len(read)==0) {
-					errChan <- io.EOF
-					return
-				}
+				read := nextPacket
+				//if(len(read)==0) {
+				//	errChan <- io.EOF
+				//	return
+				//}
 				if debugEn {
 					dbgLog.Println("R: %s!\n\n\n",read)
 					//Dump(read)
 					dbgLog.Println("\nRlen: %d!\n",len(read))
 				}
 				//Round robin
-				conn.upStreamBufs[conn.nextUpStream].bufList.PushBack(read)
-				conn.upStreamBufs[conn.nextUpStream].consProdChan <- true
-				conn.nextUpStream = (conn.nextUpStream+1) % conn.numUpStream
+				conn.getStreamBufs(isUpStream)[conn.getNextStream(isUpStream)].bufList.PushBack(read)
+				conn.getStreamBufs(isUpStream)[conn.getNextStream(isUpStream)].consProdChan <- true
+				conn.setNextStream(isUpStream, (conn.getNextStream(isUpStream)+1) % conn.getNumStreams(isUpStream))
 				
 				//Start over
 				nextPacket = conn.upStrmBuf.getNext()
 			}
-			conn.upStrmBuf.mutex.Unlock()
 		}
 	} ()
 
-	//Receive routine
-	go func() {
-		for {
-			_= <- conn.upStrmRecvChan
-			dbgLog.Println("Got a packet")
-			//TODO: Query all streams and copy from their buffers to internal buf
-		}
-
-	}()
 
 	wg.Wait()
 	if len(errChan) > 0 {
@@ -227,6 +270,7 @@ type IntrConnBuf struct {
 	mutex* sync.Mutex
 	addHdr, remvHdr bool
 	isUpstream bool
+	nextSeqExpected uint32
 	debug bool
 }
 
@@ -237,35 +281,37 @@ func NewIntrConnBuf(upStream bool, conn *Connection) *IntrConnBuf{
 	p.consProdChan = make(chan bool, 1)
 	p.mutex = &sync.Mutex{}
 	p.isUpstream = upStream
+	p.nextSeqExpected = 0
 	return p
 }
 
-func (buf IntrConnBuf) getNext() []*Packet{
+func (buf IntrConnBuf) getNext() []byte{
+	buf.mutex.Lock()
+	defer buf.mutex.Unlock()
 	for e := buf.bufList.Front(); e != nil; e = e.Next() {
 		packet := e.Value.(*Packet)
 		//Dump(packet.toByte())
 		seq := packet.getSequence()
-		temp := connection.nextSeqExpected
-		if seq == temp {
-			data := make([]*Packet, 1)
-			//TODO: Do not copy, find a way to return the value before removing the packet from list
-			data[0] = packet
-			dbgLog.Println("TTTT")
-			Dump(data[0].toByte())
+		if seq == buf.nextSeqExpected {
+			//data := make([]byte, 1)
+			var data []byte
+			if(connection.hopNum == 4 && buf.isUpstream) || (connection.hopNum == 1 && (!buf.isUpstream)){
+				data = packet.payload
+			}else {
+				data = packet.toByte()
+			}
 			if(debugEn){
 				dbgLog.Println("\n")
 				//Dump(data[0].toByte())
 			}
 			buf.bufList.Remove(e)
-			temp2 := packet.getLength()
-			connection.nextSeqExpected += (temp2 + 1)
+			buf.nextSeqExpected += (packet.getLength() + 1)
 			return data
 		}
 	}
 
-	data := make([]*Packet, 0)
+	data := make([]byte, 0)
 	return data
-
 }
 
 
@@ -339,7 +385,7 @@ func (ib *IntrConnBuf) Write(b []byte) (n int, err error){
 	
 	if(len(b)==0) {return 0, io.EOF}
 	
-	if (connection.hopNum == 1){
+	if (connection.hopNum == 1 && ib.isUpstream) || (connection.hopNum == 4 && (!ib.isUpstream)) {
 		seq := connection.nextSeqToSend
 		//packet := NewPacket(seq, b[pktHeaderSize: len(b) - 1])
 		packet := NewPacketWithSeq(seq, b)
@@ -347,11 +393,9 @@ func (ib *IntrConnBuf) Write(b []byte) (n int, err error){
 		ib.bufList.PushBack(packet)
 		Dump(packet.toByte())
 		
-	} else if (connection.hopNum == 2 || connection.hopNum == 3){
+	} else{
 		//packet := NewPacket(seq, b[pktHeaderSize: len(b) - 1])
 		packet := NewPacketFromBytes(b)
-		Dump(packet.payload)
-		connection.nextSeqToSend += packet.getLength() + 1  
 		ib.bufList.PushBack(packet)
 	}
 	if ib.debug {
@@ -549,11 +593,10 @@ func handler(conn *pt.SocksConn) error {
 		connection.addUpStream(newStream2)
 		
 		go regStrBuf2Socket([]net.Conn {remote1}, newStream1.strmBuf)
+		go regSocket2ConnBuf(connection.downStrmBuf, []net.Conn {remote1})
 		go regStrBuf2Socket([]net.Conn {remote2}, newStream2.strmBuf)
-		//go copyLoop([]net.Conn {remote1},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream1.strmBuf)
-		//go copyLoop([]net.Conn {remote2},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream2.strmBuf)
-	
-		
+		go regSocket2ConnBuf(connection.downStrmBuf, []net.Conn {remote2})
+
 		defer remote1.Close()
 		defer remote2.Close()
 		addr, err1:= net.ResolveTCPAddr("tcp","127.0.0.1:33333")
@@ -579,7 +622,7 @@ func handler(conn *pt.SocksConn) error {
 		connection.addUpStream(newStream)
 		
 		go regStrBuf2Socket([]net.Conn {remote}, newStream.strmBuf)
-		//go copyLoop([]net.Conn {conn},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream.strmBuf)
+		go regSocket2ConnBuf(connection.downStrmBuf, []net.Conn {remote})
 		
 		defer remote.Close()
 		addr, err:= net.ResolveTCPAddr("tcp","127.0.0.1:55555")
@@ -597,10 +640,11 @@ func handler(conn *pt.SocksConn) error {
 		
 		//Make new streams
 		newStream := newStream(connection)
-		//connection.addUpStream(newStream)
+		connection.addUpStream(newStream)
 		
 		 
-		go copyLoop([]net.Conn {remote},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream.strmBuf)
+		go regStrBuf2Socket([]net.Conn {remote}, newStream.strmBuf)
+		go regSocket2ConnBuf(connection.downStrmBuf, []net.Conn {remote})
 		
 		
 		defer remote.Close()
@@ -614,6 +658,7 @@ func handler(conn *pt.SocksConn) error {
 	connection.addDownStream(newStream)
 	//TODO: This should be a separate function that connects the socket, stream and connection buffer 
 	copyLoop([]net.Conn {conn},/* []net.Conn {remote},*/ connection.upStrmBuf, newStream.strmBuf)
+	//regStrBuf2Socket(newStream.strmBuf, []net.Conn {conn})
 	
 
 	return nil
