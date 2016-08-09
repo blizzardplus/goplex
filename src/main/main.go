@@ -28,11 +28,15 @@ var (
     warnLog *log.Logger
     errLog   *log.Logger
     dbgLog   *log.Logger
+    tmpLogOut  *os.File
+    tmpLogIn  *os.File
+    tmpLogMid  *os.File
+    tmpLogLastMid  *os.File
 ) 
 
-var debugEn bool = true
+var debugEn bool = false
 
-var connection *Connection
+//var connection *Connection
 
 //upStrms is from client to server
 //downStrms is from server to client
@@ -46,6 +50,9 @@ type Connection struct{
 	nextSeqToSend uint32 
 	hopNum int
 	nextHopAddr []string
+	isConnToEndHostEstabl bool
+	remoteConn net.Conn
+	connID uint32
 	mutex* sync.Mutex
 }
 
@@ -59,6 +66,7 @@ func newConnection(hopNumber int/*, something to indicate next hop*/) *Connectio
 	conn.downStreamBufs = make(map[int]*IntrStrBuf)
 	conn.upStrmBuf = NewIntrConnBuf(true, conn)
 	conn.downStrmBuf = NewIntrConnBuf(false, conn)
+	conn.isConnToEndHostEstabl = false
 	conn.mutex = &sync.Mutex{}
 	return conn
 }
@@ -73,7 +81,7 @@ func (conn *Connection) addDownStream(stream *Stream) (){
 	conn.numDownStream++
 }
 
-func (conn *Connection) createPacket(data []byte, seqNo uint32) *Packet{
+func (conn *Connection) createPacket(data []byte, seqNo uint32) Packet{
 	packet := NewPacketWithSeq(seqNo, data)
 	return packet
 }
@@ -126,7 +134,7 @@ func (conn *Connection) getStreamBufs(isUpStream bool) map[int]*IntrStrBuf{
 
 
 //Direction: client to server
-func (conn *Connection) handleUpStream(){
+func (conn *Connection) handleStreams(){
 	go conn.handleStream(true)
 	go conn.handleStream(false)
 }
@@ -137,42 +145,47 @@ func (conn *Connection) handleStream(isUpStream bool) error{
 
 	var wg sync.WaitGroup
 	wg.Add(1)
+	
 
-
-
-//conn.upStrmBuf
-//conn.nextUpStream
-//conn.numUpStream
-	//Send routine
 	go func() {
 		for {
 			_ = <- conn.getStrmBuf(isUpStream).consProdChan
-
-			if(!isUpStream) {
-				fmt.Println("Here")
+			
+			//conn.getStrmBuf(isUpStream).mutex.Lock()
+			//conn.mutex.Lock()
+			
+			if (conn.hopNum == 4) || (conn.hopNum == 1) ||  (conn.hopNum == 2) ||  (conn.hopNum == 3){
+				continue
 			}
 
 			nextPacket := conn.getStrmBuf(isUpStream).getNext()
 
 			for len(nextPacket) > 0 {
 				read := nextPacket
-				//if(len(read)==0) {
-				//	errChan <- io.EOF
-				//	return
-				//}
+				
 				if debugEn {
 					dbgLog.Println("R: %s!\n\n\n",read)
 					//Dump(read)
 					dbgLog.Println("\nRlen: %d!\n",len(read))
 				}
+////				if conn.hopNum==4 {
+////					dbgLog.Print("Sending packet to stream")
+////					dbgLog.Print(conn.getNextStream(isUpStream)) 
+////				}
 				//Round robin
 				conn.getStreamBufs(isUpStream)[conn.getNextStream(isUpStream)].bufList.PushBack(read)
 				conn.getStreamBufs(isUpStream)[conn.getNextStream(isUpStream)].consProdChan <- true
 				conn.setNextStream(isUpStream, (conn.getNextStream(isUpStream)+1) % conn.getNumStreams(isUpStream))
 				
+////				if conn.hopNum==4 {
+////					dbgLog.Print("Next stream")
+////					dbgLog.Print(conn.getNextStream(isUpStream)) 
+////				}
 				//Start over
-				nextPacket = conn.upStrmBuf.getNext()
+				nextPacket = conn.getStrmBuf(isUpStream).getNext()
 			}
+			//conn.getStrmBuf(isUpStream).mutex.Unlock()
+			//conn.mutex.Unlock()
 		}
 	} ()
 
@@ -244,21 +257,22 @@ func (p Packet) toByte() []byte{
 	return data
 }
 
-func NewPacketFromBytes(bytes []byte) *Packet{
+func NewPacketFromBytes(bytes []byte) Packet{
 	//TODO: Probably a better implementation since we already have the byte slice
 	//Something like union is better
 	p := NewPacketWithSeq(binary.BigEndian.Uint32(bytes[0:pktSeqSize]),  bytes[pktSeqSize+pktLenSize :])
 	return p
 }
-func NewPacketWithSeq(sequence uint32, payload []byte) *Packet{
+func NewPacketWithSeq(sequence uint32, payload []byte) Packet{
 	p := new(Packet)
 	p.sequence = make([]byte, pktSeqSize)
 	p.length = make([]byte, pktLenSize)
 	binary.BigEndian.PutUint32(p.sequence, sequence) 
 	p.payload = payload
 	//p.length = uint32(len(header) + len(data))
+	//Length is an override
 	binary.BigEndian.PutUint32(p.length, sequence + uint32(len(payload))) 
-	return p
+	return *p
 }
 
 //Internal buffer interface 
@@ -267,9 +281,12 @@ type IntrConnBuf struct {
 	conn *Connection
 	bufList* list.List
 	consProdChan chan bool
+tempConsProdChan chan bool
+nextToDump uint32
 	mutex* sync.Mutex
+	bufferMutex* sync.Mutex
 	addHdr, remvHdr bool
-	isUpstream bool
+	isUpStream bool
 	nextSeqExpected uint32
 	debug bool
 }
@@ -278,39 +295,60 @@ func NewIntrConnBuf(upStream bool, conn *Connection) *IntrConnBuf{
 	p := new(IntrConnBuf)
 	p.conn = conn
 	p.bufList = list.New()
-	p.consProdChan = make(chan bool, 1)
+	p.consProdChan = make(chan bool)
+p.tempConsProdChan = make(chan bool)
+p.nextToDump = 0
 	p.mutex = &sync.Mutex{}
-	p.isUpstream = upStream
+	p.bufferMutex = &sync.Mutex{}
+	p.isUpStream = upStream
 	p.nextSeqExpected = 0
 	return p
 }
 
-func (buf IntrConnBuf) getNext() []byte{
-	buf.mutex.Lock()
-	defer buf.mutex.Unlock()
+func (buf *IntrConnBuf) getNext() []byte{
+	var data []byte	
+	
+//if !buf.isUpstream{
+//data = make([]byte, 0)
+//return data
+//}
+
+	buf.bufferMutex.Lock()
 	for e := buf.bufList.Front(); e != nil; e = e.Next() {
-		packet := e.Value.(*Packet)
-		//Dump(packet.toByte())
+		
+		packet := e.Value.(Packet)
+
+		if (buf.conn.hopNum == 2 || buf.conn.hopNum == 3){
+			buf.bufList.Remove(e)
+			buf.bufferMutex.Unlock()
+			data = packet.toByte()
+			return data
+		}
 		seq := packet.getSequence()
 		if seq == buf.nextSeqExpected {
+			buf.bufList.Remove(e)
+			buf.nextSeqExpected += (packet.getLength() + 1)
+			buf.bufferMutex.Unlock()
 			//data := make([]byte, 1)
-			var data []byte
-			if(connection.hopNum == 4 && buf.isUpstream) || (connection.hopNum == 1 && (!buf.isUpstream)){
+			if(buf.conn.hopNum == 4 && buf.isUpStream) || (buf.conn.hopNum == 1 && (!buf.isUpStream)){
 				data = packet.payload
 			}else {
 				data = packet.toByte()
 			}
-			if(debugEn){
-				dbgLog.Println("\n")
-				//Dump(data[0].toByte())
+			
+			if !buf.isUpStream && buf.conn.hopNum == 4 {
+				fmt.Println("Packet " + fmt.Sprint(packet.getSequence()) + " of size " + fmt.Sprint(packet.getLength())+":\n\n")
+				Dump(packet.payload)
+				tmpLogOut.WriteString("Packet " + fmt.Sprint(packet.getSequence()) + " of size " + fmt.Sprint(packet.getLength())+":\n\n")
+				tmpLogOut.Write(packet.payload)
+				tmpLogOut.WriteString("\n\n--------\n\n")
 			}
-			buf.bufList.Remove(e)
-			buf.nextSeqExpected += (packet.getLength() + 1)
+			
 			return data
 		}
 	}
 
-	data := make([]byte, 0)
+	data = make([]byte, 0)
 	return data
 }
 
@@ -373,37 +411,148 @@ func (ib *IntrConnBuf) Read(b []byte) (n int, err error){
 	return 0, err
 }
 
+func (ib *IntrConnBuf) Dumper() (){
+	fmt.Println("in Dumper")
+	<-ib.tempConsProdChan
+	var read []byte
+	
+	if (ib.conn.hopNum == 2 || ib.conn.hopNum == 3){
+		ib.mutex.Lock()
+		for e := ib.bufList.Front(); e != nil; e = e.Next() {
+			packet := e.Value.(Packet)
+			ib.bufList.Remove(e)
+			read = packet.toByte()
+			
+			//Round robin
+			ib.conn.getStreamBufs(ib.isUpStream)[ib.conn.getNextStream(ib.isUpStream)].bufList.PushBack(read)
+			ib.conn.getStreamBufs(ib.isUpStream)[ib.conn.getNextStream(ib.isUpStream)].consProdChan <- true
+			ib.conn.setNextStream(ib.isUpStream, (ib.conn.getNextStream(ib.isUpStream)+1) % ib.conn.getNumStreams(ib.isUpStream))
+		}
+		ib.mutex.Unlock()
+		return
+	}
+	
+	if (ib.conn.hopNum == 4) || (ib.conn.hopNum == 1){
+		ib.mutex.Lock()
+		
+		for e := ib.bufList.Front(); e != nil; e = e.Next() {
+			packet := e.Value.(Packet)
+		
+			seq := packet.getSequence()
+			if seq == ib.nextToDump {
+				ib.bufList.Remove(e)
+				
+				tmpLogLastMid.WriteString("Next Packet " + fmt.Sprint(packet.getSequence()) + " of size " + fmt.Sprint(packet.getLength())+":\n\n")
+				tmpLogLastMid.Write(packet.payload)
+				tmpLogLastMid.WriteString("\n\n--------\n\n")
+				ib.nextToDump += (packet.getLength() + 1)
+				
+				
+				if(ib.conn.hopNum == 4 && ib.isUpStream) || (ib.conn.hopNum == 1 && (!ib.isUpStream)){
+					read = packet.payload
+				}else {
+					read = packet.toByte()
+				}
+
+				//Round robin
+				ib.conn.getStreamBufs(ib.isUpStream)[ib.conn.getNextStream(ib.isUpStream)].bufList.PushBack(read)
+				ib.conn.getStreamBufs(ib.isUpStream)[ib.conn.getNextStream(ib.isUpStream)].consProdChan <- true
+				ib.conn.setNextStream(ib.isUpStream, (ib.conn.getNextStream(ib.isUpStream)+1) % ib.conn.getNumStreams(ib.isUpStream))
+			}
+		}
+		
+		ib.mutex.Unlock()
+		
+		
+	}
+	
+	
+	
+}
+
 // Write writes data to the connection.
+
 // Write can be made to time out and return a Error with Timeout() == true
 // after a fixed time limit; see SetDeadline and SetWriteDeadline.
 func (ib *IntrConnBuf) Write(b []byte) (n int, err error){
-	ib.mutex.Lock()
-	connection.mutex.Lock()
-	defer ib.mutex.Unlock()
-	defer connection.mutex.Unlock()
 	
+	//ib.conn.mutex.Lock()
+	
+	//defer ib.conn.mutex.Unlock()
+
 	
 	if(len(b)==0) {return 0, io.EOF}
 	
-	if (connection.hopNum == 1 && ib.isUpstream) || (connection.hopNum == 4 && (!ib.isUpstream)) {
-		seq := connection.nextSeqToSend
-		//packet := NewPacket(seq, b[pktHeaderSize: len(b) - 1])
+	if (ib.conn.hopNum == 1 && ib.isUpStream) || (ib.conn.hopNum == 4 && (!ib.isUpStream)) {
+		ib.mutex.Lock()
+		seq := ib.conn.nextSeqToSend
 		packet := NewPacketWithSeq(seq, b)
-		connection.nextSeqToSend += packet.getLength() + 1  
+		ib.conn.nextSeqToSend += packet.getLength() + 1  
+		
+		ib.bufferMutex.Lock()
 		ib.bufList.PushBack(packet)
-		Dump(packet.toByte())
+		ib.bufferMutex.Unlock()
+
+		if(!ib.isUpStream){
+		//dbgLog.Println("Received")
+		//dbgLog.Println(packet.getSequence())
+		//dbgLog.Println(packet.getLength())
+		//Dump(packet.payload)
+		tmpLogIn.WriteString("Next Packet " + fmt.Sprint(packet.getSequence()) + " of size " + fmt.Sprint(packet.getLength())+":\n\n")
+		tmpLogIn.Write(packet.payload)
+		tmpLogIn.WriteString("\n\n--------\n\n")
+	
+		tmpPckt := ib.bufList.Back().Value.(Packet)
+		tmpLogMid.WriteString("Next Packet " + fmt.Sprint(tmpPckt.getSequence()) + " of size " + fmt.Sprint(tmpPckt.getLength())+":\n\n")
+		tmpLogMid.Write(tmpPckt.payload)
+		tmpLogMid.WriteString("\n\n--------\n\n")
+		
+
+		}
+		
+		ib.mutex.Unlock()
 		
 	} else{
 		//packet := NewPacket(seq, b[pktHeaderSize: len(b) - 1])
+		ib.mutex.Lock()
 		packet := NewPacketFromBytes(b)
+		
+		ib.bufferMutex.Lock()
 		ib.bufList.PushBack(packet)
+		ib.bufferMutex.Unlock()
+
+		if(!ib.isUpStream){
+		dbgLog.Println("Received")
+		dbgLog.Println(packet.getSequence())
+		dbgLog.Println(packet.getLength())
+		//Dump(packet.payload)
+		
+		tmpPckt := ib.bufList.Back().Value.(Packet)
+		tmpLogMid.WriteString("Next Packet " + fmt.Sprint(tmpPckt.getSequence()) + " of size " + fmt.Sprint(tmpPckt.getLength())+":\n\n")
+		tmpLogMid.Write(tmpPckt.payload)
+		tmpLogMid.WriteString("\n\n--------\n\n")
+		}
+		
+		ib.mutex.Unlock()
+		
 	}
-	if ib.debug {
-		dbgLog.Println("IntrConnBuf:Write")
-		Dump(b)
-		//dbgLog.Println("W: %s!\n\n\n",b)
-		//dbgLog.Println("\nWlen: %d!\n",len(b))
+//if (ib.conn.hopNum == 4) || (ib.conn.hopNum == 1){
+	go ib.Dumper()	
+	ib.tempConsProdChan <- true
+/*
+for e := ib.bufList.Front(); e != nil; e = e.Next() {
+		packet := e.Value.(Packet)
+
+		seq := packet.getSequence()
+		if seq == ib.nextToDump {
+			tmpLogLastMid.WriteString("Next Packet " + fmt.Sprint(packet.getSequence()) + " of size " + fmt.Sprint(packet.getLength())+":\n\n")
+			tmpLogLastMid.Write(packet.payload)
+			tmpLogLastMid.WriteString("\n\n--------\n\n")
+		}
+		ib.nextToDump += (packet.getLength() + 1)
 	}
+	*/
+//}
 	
 	ib.consProdChan <- true
 	return len(b), err
@@ -414,8 +563,9 @@ func (ib *IntrConnBuf) Write(b []byte) (n int, err error){
 // after a fixed time limit; see SetDeadline and SetReadDeadline.
 func (ib *IntrStrBuf) Read(b []byte) (n int, err error){
 	
-	
-	dbgLog.Println("Waiting to Read on Stream: "+  strconv.Itoa(ib.str.streamID) + "\n\n")
+	if debugEn { 
+		dbgLog.Println("Waiting to Read on Stream: "+  strconv.Itoa(ib.str.streamID) + "\n\n")
+	}
 	chanErr:= <- ib.consProdChan
 	ib.mutex.Lock()
 	defer ib.mutex.Unlock()
@@ -470,7 +620,7 @@ func (ib *IntrStrBuf) Write(b []byte) (n int, err error){
 }
 
 
-var handlerChan = make(chan int)
+
 func regSocket2ConnBuf(connBuf *IntrConnBuf, sockets []net.Conn) error {
 	errChan := make(chan error, 1)
 
@@ -561,7 +711,21 @@ func copyLoop(aArr/*, bArr */[]net.Conn, a2bBuff *IntrConnBuf, b2aBuff *IntrStrB
 
 		return nil
 	}
-func handler(conn *pt.SocksConn) error {
+
+var globalConnection *Connection
+func handler(conn *pt.SocksConn, hopNum int) error {
+	
+	
+	var connection *Connection
+	if (hopNum == 4) && (globalConnection != nil){
+		 connection = globalConnection
+	}else {
+		connection = newConnection(hopNum)
+		globalConnection = connection
+	}
+	
+	go connection.handleStreams()
+	
 	infoLog.Println("Handler!")
 	if (connection.hopNum == 1) {
 		defer conn.Close()
@@ -585,6 +749,9 @@ func handler(conn *pt.SocksConn) error {
 			if err2 != nil {return err2}
 		}
 		
+		defer remote1.Close()
+		defer remote2.Close()
+		
 		//Make new streams
 		newStream1 := newStream(connection)
 		connection.addUpStream(newStream1)
@@ -597,8 +764,6 @@ func handler(conn *pt.SocksConn) error {
 		go regStrBuf2Socket([]net.Conn {remote2}, newStream2.strmBuf)
 		go regSocket2ConnBuf(connection.downStrmBuf, []net.Conn {remote2})
 
-		defer remote1.Close()
-		defer remote2.Close()
 		addr, err1:= net.ResolveTCPAddr("tcp","127.0.0.1:33333")
 		err1 = conn.Grant(addr)
 		if err1 != nil {
@@ -616,6 +781,7 @@ func handler(conn *pt.SocksConn) error {
 			conn.Reject()
 			return err
 		}
+		defer remote.Close()
 		
 		//Make new streams
 		newStream := newStream(connection)
@@ -624,7 +790,6 @@ func handler(conn *pt.SocksConn) error {
 		go regStrBuf2Socket([]net.Conn {remote}, newStream.strmBuf)
 		go regSocket2ConnBuf(connection.downStrmBuf, []net.Conn {remote})
 		
-		defer remote.Close()
 		addr, err:= net.ResolveTCPAddr("tcp","127.0.0.1:55555")
 		err = conn.Grant(addr)
 		if err != nil {
@@ -632,23 +797,33 @@ func handler(conn *pt.SocksConn) error {
 		}
 	} else if (connection.hopNum == 4) {
 		defer conn.Close()
-		remote, err := net.Dial("tcp", conn.Req.Target)
-		if err != nil {
-			conn.Reject()
-			return err
+		
+		if !connection.isConnToEndHostEstabl{
+			remote, err := net.Dial("tcp", conn.Req.Target)
+			if err != nil {
+				conn.Reject()
+				return err
+			} else{
+				defer remote.Close()
+				connection.isConnToEndHostEstabl = true
+				connection.remoteConn = remote
+			}
+			
+			//Make new streams
+			newStream := newStream(connection)
+			connection.addUpStream(newStream)
+			 
+			go regStrBuf2Socket([]net.Conn {remote}, newStream.strmBuf)
+			go regSocket2ConnBuf(connection.downStrmBuf, []net.Conn {remote})
+			
+			err = conn.Grant(remote.RemoteAddr().(*net.TCPAddr))
+			if err != nil {
+				return err
+			}
 		}
 		
-		//Make new streams
-		newStream := newStream(connection)
-		connection.addUpStream(newStream)
 		
-		 
-		go regStrBuf2Socket([]net.Conn {remote}, newStream.strmBuf)
-		go regSocket2ConnBuf(connection.downStrmBuf, []net.Conn {remote})
-		
-		
-		defer remote.Close()
-		err = conn.Grant(remote.RemoteAddr().(*net.TCPAddr))
+		err := conn.Grant(connection.remoteConn.RemoteAddr().(*net.TCPAddr))
 		if err != nil {
 			return err
 		}
@@ -664,7 +839,7 @@ func handler(conn *pt.SocksConn) error {
 	return nil
 }
 
-func acceptLoop(ln *pt.SocksListener) error {
+func acceptLoop(ln *pt.SocksListener, hopNum int) error {
 	defer ln.Close()
 	for {
 		infoLog.Println("Accepting!")
@@ -677,7 +852,7 @@ func acceptLoop(ln *pt.SocksListener) error {
 			return err
 		}
 		go func() {
-			err := handler(conn)
+			err := handler(conn, hopNum)
 			if err != nil {
 				errLog.Println("handler error: %s", err)
 			}
@@ -688,14 +863,43 @@ func acceptLoop(ln *pt.SocksListener) error {
 
 
 func intiateLogger(){
-	traceLog = log.New(os.Stdout,"Trace: ",log.Ldate|log.Ltime|log.Lshortfile)
-	infoLog = log.New(os.Stdout,"INFO: ",log.Ldate|log.Ltime|log.Lshortfile)
-	errLog = log.New(os.Stderr,"Error: ",log.Ldate|log.Ltime|log.Lshortfile)
-	warnLog = log.New(os.Stdout,"Warn: ",log.Ldate|log.Ltime|log.Lshortfile)
-	dbgLog = log.New(os.Stdout,"Warn: ",log.Ldate|log.Ltime|log.Lshortfile)
+	traceLog = log.New(os.Stdout,"Trace: ", log.Ldate|log.Ltime|log.Lshortfile)
+	infoLog = log.New(os.Stdout,"INFO: ", log.Ldate|log.Ltime|log.Lshortfile)
+	errLog = log.New(os.Stderr,"Error: ", log.Ldate|log.Ltime|log.Lshortfile)
+	warnLog = log.New(os.Stdout,"Warn: ", log.Ldate|log.Ltime|log.Lshortfile)
+	dbgLog = log.New(os.Stdout,"Debug: ", log.Ldate|log.Ltime|log.Lshortfile)
+	
+	
+	hopNum := os.Args[1]
+	//if hopNum == 4{
+		var err, err2, err3, err4 error
+		tmpLogOut, err = os.OpenFile("/tmp/out" + hopNum, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
+		if err != nil {
+		    fmt.Println("error opening file: %v", err)
+		}
+		//tmpLogOut = log.New(f,"",0)
+		
+		tmpLogIn, err2 = os.OpenFile("/tmp/in" + hopNum, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
+		if err2 != nil {
+		    fmt.Println("error opening file: %v", err)
+		}
+		
+		tmpLogMid, err3 = os.OpenFile("/tmp/mid" + hopNum, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
+		if err3 != nil {
+		    fmt.Println("error opening file: %v", err)
+		}
+		
+		tmpLogLastMid, err4 = os.OpenFile("/tmp/lastmid" + hopNum, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
+		if err4 != nil {
+		    fmt.Println("error opening file: %v", err)
+		}
+		//tmpLogIn = log.New(f2,"",0)
+	//}
 
 }
 
+
+var handlerChan = make(chan int)
 func main() {
 	intiateLogger()
 	pt.SocksInit()
@@ -709,19 +913,17 @@ func main() {
 	if err != nil {
 		errLog.Println("Argument error!")
 	}
-	connection = newConnection(hopNum)
-	go connection.handleUpStream()
 	
 	listeners := make([]net.Listener, 0)
 	
 	var ln *pt.SocksListener
-	if (connection.hopNum == 1) {
+	if (hopNum == 1) {
 		ln, err = pt.ListenSocks("tcp", "127.0.0.1:22222")
-	} else if (connection.hopNum == 2){
+	} else if (hopNum == 2){
 		ln, err = pt.ListenSocks("tcp", "127.0.0.1:33333")
-	} else if (connection.hopNum == 3){
+	} else if (hopNum == 3){
 		ln, err = pt.ListenSocks("tcp", "127.0.0.1:44444")
-	} else if (connection.hopNum == 4){
+	} else if (hopNum == 4){
 		ln, err = pt.ListenSocks("tcp", "127.0.0.1:55555")
 	}
 
@@ -729,7 +931,7 @@ func main() {
 	if err != nil {
 		errLog.Println("Error!")
 	}
-	go acceptLoop(ln)
+	go acceptLoop(ln, hopNum)
 	pt.Cmethod("Main", ln.Version(), ln.Addr())
 	listeners = append(listeners, ln)
 	pt.CmethodsDone()
@@ -787,6 +989,7 @@ func Dump(by []byte) {
 	n := len(by)
 	rowcount := 0
 	stop := (n / 8) * 8
+	//stop = 7
 	k := 0
 	for i := 0; i <= stop; i += 8 {
 		k++
