@@ -18,6 +18,7 @@ package main
 	"strconv"
 	"net/url"
 	"golang.org/x/net/proxy"
+	"time"
 )
 
 
@@ -29,9 +30,6 @@ var (
     errLog   *log.Logger
     dbgLog   *log.Logger
     tmpLogOut  *os.File
-    tmpLogIn  *os.File
-    tmpLogMid  *os.File
-    tmpLogLastMid  *os.File
 ) 
 
 var debugEn bool = false
@@ -54,6 +52,11 @@ type Connection struct{
 	remoteConn net.Conn
 	connID uint32
 	mutex* sync.Mutex
+	
+	upConsProdChan, downConsProdChan chan Packet
+	upStreamQ, downStreamQ *list.List
+	upStreamQMutex, downStreamQMutex *sync.Mutex
+	upStreamNextToSend, downStreamNextToSend uint32
 }
 
 func newConnection(hopNumber int/*, something to indicate next hop*/) *Connection{
@@ -68,6 +71,7 @@ func newConnection(hopNumber int/*, something to indicate next hop*/) *Connectio
 	conn.downStrmBuf = NewIntrConnBuf(false, conn)
 	conn.isConnToEndHostEstabl = false
 	conn.mutex = &sync.Mutex{}
+
 	return conn
 }
 
@@ -122,6 +126,7 @@ func (conn *Connection) getNumStreams(isUpStream bool) int{
 	}
 }
 
+
 func (conn *Connection) getStreamBufs(isUpStream bool) map[int]*IntrStrBuf{
 	if isUpStream { 
 		return conn.upStreamBufs
@@ -138,6 +143,7 @@ func (conn *Connection) handleStreams(){
 	go conn.handleStream(true)
 	go conn.handleStream(false)
 }
+
 
 func (conn *Connection) handleStream(isUpStream bool) error{
 	
@@ -412,7 +418,7 @@ func (ib *IntrConnBuf) Read(b []byte) (n int, err error){
 }
 
 func (ib *IntrConnBuf) Dumper() (){
-	fmt.Println("in Dumper")
+	//fmt.Println("in Dumper")
 	<-ib.tempConsProdChan
 	var read []byte
 	
@@ -422,6 +428,12 @@ func (ib *IntrConnBuf) Dumper() (){
 			packet := e.Value.(Packet)
 			ib.bufList.Remove(e)
 			read = packet.toByte()
+			
+			if(!ib.isUpStream){
+				tmpLogOut.WriteString("Next Packet " + fmt.Sprint(packet.getSequence()) + " of size " + fmt.Sprint(packet.getLength())+":\n\n")
+				tmpLogOut.Write(packet.payload)
+				tmpLogOut.WriteString("\n\n--------\n\n")
+			}
 			
 			//Round robin
 			ib.conn.getStreamBufs(ib.isUpStream)[ib.conn.getNextStream(ib.isUpStream)].bufList.PushBack(read)
@@ -440,11 +452,15 @@ func (ib *IntrConnBuf) Dumper() (){
 		
 			seq := packet.getSequence()
 			if seq == ib.nextToDump {
-				ib.bufList.Remove(e)
 				
-				tmpLogLastMid.WriteString("Next Packet " + fmt.Sprint(packet.getSequence()) + " of size " + fmt.Sprint(packet.getLength())+":\n\n")
-				tmpLogLastMid.Write(packet.payload)
-				tmpLogLastMid.WriteString("\n\n--------\n\n")
+				if(!ib.isUpStream){
+				tmpLogOut.WriteString("Next Packet " + fmt.Sprint(packet.getSequence()) + " of size " + fmt.Sprint(packet.getLength())+":\n\n")
+				tmpLogOut.Write(packet.payload)
+				tmpLogOut.WriteString("\n\n--------\n\n")
+				}
+
+				ib.bufList.Remove(e)
+
 				ib.nextToDump += (packet.getLength() + 1)
 				
 				
@@ -492,23 +508,6 @@ func (ib *IntrConnBuf) Write(b []byte) (n int, err error){
 		ib.bufferMutex.Lock()
 		ib.bufList.PushBack(packet)
 		ib.bufferMutex.Unlock()
-
-		if(!ib.isUpStream){
-		//dbgLog.Println("Received")
-		//dbgLog.Println(packet.getSequence())
-		//dbgLog.Println(packet.getLength())
-		//Dump(packet.payload)
-		tmpLogIn.WriteString("Next Packet " + fmt.Sprint(packet.getSequence()) + " of size " + fmt.Sprint(packet.getLength())+":\n\n")
-		tmpLogIn.Write(packet.payload)
-		tmpLogIn.WriteString("\n\n--------\n\n")
-	
-		tmpPckt := ib.bufList.Back().Value.(Packet)
-		tmpLogMid.WriteString("Next Packet " + fmt.Sprint(tmpPckt.getSequence()) + " of size " + fmt.Sprint(tmpPckt.getLength())+":\n\n")
-		tmpLogMid.Write(tmpPckt.payload)
-		tmpLogMid.WriteString("\n\n--------\n\n")
-		
-
-		}
 		
 		ib.mutex.Unlock()
 		
@@ -517,42 +516,19 @@ func (ib *IntrConnBuf) Write(b []byte) (n int, err error){
 		ib.mutex.Lock()
 		packet := NewPacketFromBytes(b)
 		
+		//ib.conn.downConsProdChan <- packet
+		
 		ib.bufferMutex.Lock()
 		ib.bufList.PushBack(packet)
 		ib.bufferMutex.Unlock()
-
-		if(!ib.isUpStream){
-		dbgLog.Println("Received")
-		dbgLog.Println(packet.getSequence())
-		dbgLog.Println(packet.getLength())
-		//Dump(packet.payload)
-		
-		tmpPckt := ib.bufList.Back().Value.(Packet)
-		tmpLogMid.WriteString("Next Packet " + fmt.Sprint(tmpPckt.getSequence()) + " of size " + fmt.Sprint(tmpPckt.getLength())+":\n\n")
-		tmpLogMid.Write(tmpPckt.payload)
-		tmpLogMid.WriteString("\n\n--------\n\n")
-		}
 		
 		ib.mutex.Unlock()
 		
 	}
-//if (ib.conn.hopNum == 4) || (ib.conn.hopNum == 1){
 	go ib.Dumper()	
 	ib.tempConsProdChan <- true
-/*
-for e := ib.bufList.Front(); e != nil; e = e.Next() {
-		packet := e.Value.(Packet)
 
-		seq := packet.getSequence()
-		if seq == ib.nextToDump {
-			tmpLogLastMid.WriteString("Next Packet " + fmt.Sprint(packet.getSequence()) + " of size " + fmt.Sprint(packet.getLength())+":\n\n")
-			tmpLogLastMid.Write(packet.payload)
-			tmpLogLastMid.WriteString("\n\n--------\n\n")
-		}
-		ib.nextToDump += (packet.getLength() + 1)
-	}
-	*/
-//}
+	time.Sleep(time.Millisecond)
 	
 	ib.consProdChan <- true
 	return len(b), err
@@ -584,12 +560,6 @@ func (ib *IntrStrBuf) Read(b []byte) (n int, err error){
 
 	ib.bufList.Remove(ib.bufList.Front())
 	
-	if ib.debug {
-		//dbgLog.Println("IntrStrBuf:Read")
-		//dbgLog.Println("R: %s!\n\n\n",b)
-		//dbgLog.Println("\nRlen: %d!\n",len(read))
-	}
-
 	return len(read), err
 }
 
@@ -872,30 +842,12 @@ func intiateLogger(){
 	
 	hopNum := os.Args[1]
 	//if hopNum == 4{
-		var err, err2, err3, err4 error
+		var err error
 		tmpLogOut, err = os.OpenFile("/tmp/out" + hopNum, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
 		if err != nil {
 		    fmt.Println("error opening file: %v", err)
 		}
-		//tmpLogOut = log.New(f,"",0)
 		
-		tmpLogIn, err2 = os.OpenFile("/tmp/in" + hopNum, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
-		if err2 != nil {
-		    fmt.Println("error opening file: %v", err)
-		}
-		
-		tmpLogMid, err3 = os.OpenFile("/tmp/mid" + hopNum, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
-		if err3 != nil {
-		    fmt.Println("error opening file: %v", err)
-		}
-		
-		tmpLogLastMid, err4 = os.OpenFile("/tmp/lastmid" + hopNum, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
-		if err4 != nil {
-		    fmt.Println("error opening file: %v", err)
-		}
-		//tmpLogIn = log.New(f2,"",0)
-	//}
-
 }
 
 
